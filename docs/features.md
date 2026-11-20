@@ -87,7 +87,9 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   around `target/kiri-windows-x86_64`; `kiri.ps1` in that folder installs
   the same without an MSI). Not TCP:
   WSL's localhost relay drops half-closes, and `docker run` loses its
-  output
+  output; not UDP either, which that relay does not carry at all, so
+  `kiri-win.exe` binds published UDP ports on Windows and relays their
+  datagrams to the engine with `kiri udprelay` in the distro
 
 Kubernetes LoadBalancer services are published on `localhost`, and
 `kiri machine create NAME --systemd` boots systemd as the machine's init.

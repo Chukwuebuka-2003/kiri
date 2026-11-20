@@ -388,6 +388,8 @@ fn refresh() {
     let lists = (|| -> io::Result<Value> {
         // Quick: a refresh never holds the engine thread behind a start.
         let containers = client::get_quick("/containers/json?all=1")?;
+        // WSL forwards TCP to Windows' localhost itself, but not UDP.
+        crate::udprelay_win::sync(&containers);
         let images = client::get_quick("/images/json")?;
         let volumes = client::get_quick("/volumes")?;
         let networks = client::get_quick("/networks")?;

@@ -44,6 +44,13 @@ mod relay;
 #[cfg(windows)]
 #[path = "../../kiri/src/hostrelay.rs"]
 mod hostrelay;
+// Published UDP ports, which WSL's localhost relay does not carry:
+// udprelay_win.rs, over frames shared with the WSL end.
+#[cfg(windows)]
+#[path = "../../kiri/src/udprelay.rs"]
+mod udprelay_proto;
+#[cfg(windows)]
+mod udprelay_win;
 #[cfg(windows)]
 mod win;
 // The window's USB view, through usbipd-win.

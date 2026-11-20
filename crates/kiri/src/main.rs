@@ -27,6 +27,9 @@ mod bridge;
 // Linux only (WSL's end of kiri-win's proxy relay); its tests run anywhere.
 #[cfg(unix)]
 mod hostrelay;
+// Linux only (WSL's end of kiri-win's UDP port relay); its tests run anywhere.
+#[cfg(unix)]
+mod udprelay;
 #[cfg(unix)]
 mod cli_pins;
 #[cfg(unix)]
@@ -119,6 +122,8 @@ fn main() -> ExitCode {
         Some("bridge") => bridge::run(&args[1..]),
         #[cfg(target_os = "linux")]
         Some("hostrelay") => hostrelay::run(),
+        #[cfg(target_os = "linux")]
+        Some("udprelay") => udprelay::run(),
         // Linux hosts: what the window's onboarding needs root for (through pkexec).
         #[cfg(target_os = "linux")]
         Some("host-access") => match hostaccess::run(&args[1..]) {
