@@ -445,13 +445,22 @@ impl Dns {
         // The host's names are the host's whatever a container is called:
         // a name registered for one of them is never answered.
         let is_host = HOST_NAMES.contains(&name.as_str());
+        let known = |n: &str| {
+            self.servers[server].bridges.iter().any(|b| self.names.get(b).is_some_and(|t| t.contains_key(n)) || self.names6.get(b).is_some_and(|t| t.contains_key(n)))
+        };
+        // gRPC's SRV lookup of `_grpclb._tcp.<name>` names a container on
+        // this network. Answer NODATA for the service here: there are no
+        // SRV records, and forwarding the query would leave Go's resolver
+        // waiting for an upstream we can't rely on (#715).
+        let service = if is_host { None } else { service_base(&name, known) };
+        let lookup = service.unwrap_or(&name);
         let bridge = self.servers[server]
             .bridges
             .iter()
-            .filter(|b| !is_host && (self.names.get(*b).is_some_and(|t| t.contains_key(&name)) || self.names6.get(*b).is_some_and(|t| t.contains_key(&name))))
+            .filter(|b| !is_host && (self.names.get(*b).is_some_and(|t| t.contains_key(lookup)) || self.names6.get(*b).is_some_and(|t| t.contains_key(lookup))))
             .min_by_key(|b| self.networks.get(*b).map_or(b.as_str(), String::as_str));
-        let addrs = bridge.and_then(|b| self.names.get(b)).and_then(|t| t.get(&name));
-        let addrs6 = bridge.and_then(|b| self.names6.get(b)).and_then(|t| t.get(&name));
+        let addrs = bridge.and_then(|b| self.names.get(b)).and_then(|t| t.get(lookup));
+        let addrs6 = bridge.and_then(|b| self.names6.get(b)).and_then(|t| t.get(lookup));
         // The host's names answer A with the host's address, and AAAA with
         // no records: the host relay is IPv4 only.
         let addrs = match addrs {
@@ -463,8 +472,11 @@ impl Dns {
         if addrs.is_none() && addrs6.is_none() {
             return None;
         }
-        let a: &[[u8; 4]] = if qtype == 1 || qtype == 255 { addrs.map_or(&[], Vec::as_slice) } else { &[] };
-        let aaaa: &[([u8; 4], [u8; 16])] = if qtype == 28 || qtype == 255 { addrs6.map_or(&[], Vec::as_slice) } else { &[] };
+        // A service name has no records of its own: the container it
+        // belongs to has the addresses, and the caller looks those up by
+        // the container's name.
+        let a: &[[u8; 4]] = if service.is_none() && (qtype == 1 || qtype == 255) { addrs.map_or(&[], Vec::as_slice) } else { &[] };
+        let aaaa: &[([u8; 4], [u8; 16])] = if service.is_none() && (qtype == 28 || qtype == 255) { addrs6.map_or(&[], Vec::as_slice) } else { &[] };
         let mut r = Vec::with_capacity(end + 16 * a.len() + 28 * aaaa.len());
         r.extend_from_slice(&q[0..2]); // id
         r.extend_from_slice(&[0x81, 0x80]); // response, recursion desired + available
@@ -535,7 +547,13 @@ impl Dns {
             Some(s) => (s, false),
             None if may_relay => match self.relay_stream(&msg) {
                 Some(s) => (s, true),
-                None => return,
+                // No upstream and no host relay (it may be backing off):
+                // answer at once rather than leave Go's resolver to time
+                // out waiting for a reply that will never come (#715).
+                None => {
+                    send_to(self.servers[server].sock.as_raw_fd(), &servfail(id, rd(q), &q[12..end]), &client);
+                    return;
+                }
             },
             // None of its own can be sent to: SERVFAIL, not silence.
             None if own.is_some() => {
@@ -675,13 +693,14 @@ impl Dns {
                 if msg.len() >= 12 && u16::from_be_bytes([msg[0], msg[1]]) == p.our && response_matches(&msg, p) {
                     self.answered(at, &mut msg);
                 } else {
-                    self.pending.swap_remove(at);
+                    // A reply we can't use is still better answered than
+                    // dropped: the client would only wait for its timeout.
+                    self.fail(at);
                 }
             }
-            // Gone before a whole reply: the client asks again.
-            None if eof => {
-                self.pending.swap_remove(at);
-            }
+            // Gone before a whole reply: answer SERVFAIL now, as with any
+            // other upstream that didn't answer (#715).
+            None if eof => self.fail(at),
             None => self.pending[at].relayed = Some(got),
         }
     }
@@ -728,7 +747,9 @@ impl Dns {
             } else if p.may_relay && now.duration_since(p.sent) >= FALLBACK_AFTER {
                 self.relay(at);
             } else if now.duration_since(p.sent) >= FORWARD_TIMEOUT {
-                self.pending.swap_remove(at);
+                // An upstream that never answered must not leave the
+                // client to hit its own timeout with no reply at all.
+                self.fail(at);
             }
         }
     }
@@ -739,16 +760,17 @@ impl Dns {
         let left = |from: Instant, wait: Duration| wait.saturating_sub(now.duration_since(from));
         self.pending
             .iter()
-            .filter_map(|p| {
+            .map(|p| {
                 let due = if p.own.is_some() {
                     left(p.sent, OWN_WAIT).min(left(p.started, OWN_DEADLINE))
                 } else if p.may_relay {
-                    left(p.sent, FALLBACK_AFTER)
+                    left(p.sent, FALLBACK_AFTER).min(left(p.sent, FORWARD_TIMEOUT))
                 } else {
-                    // Swept by the next lookup (or `on_timer`), no wake-up for it.
-                    return None;
+                    // Even with no relay left, the query must be answered
+                    // when its timeout expires, not only on the next lookup.
+                    left(p.sent, FORWARD_TIMEOUT)
                 };
-                Some(wait_ms(due))
+                wait_ms(due)
             })
             .min()
             .unwrap_or(-1)
@@ -906,6 +928,22 @@ fn parse_question(q: &[u8]) -> Option<(String, u16, usize)> {
     Some((name, qtype, i + 4))
 }
 
+/// The container name a service query is about, when the labels before it
+/// are underscore selectors: gRPC looks up `_grpclb._tcp.<name>` as an SRV
+/// record before asking for the name's A records. Such a name belongs to
+/// this network, so it is answered here (NODATA) rather than forwarded to
+/// an upstream that may never answer (#715).
+fn service_base(name: &str, known: impl Fn(&str) -> bool) -> Option<&str> {
+    let mut rest = name;
+    while let Some((selectors, tail)) = rest.split_once('.') {
+        if selectors.split('.').all(|l| l.starts_with('_')) && known(tail) {
+            return Some(tail);
+        }
+        rest = tail;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Dns, Pending, Server, response_matches, udp_socket};
@@ -942,6 +980,72 @@ mod tests {
         assert!(dns.answer(0, &query("db", 1)).is_none(), "gone with the network");
         dns.drop_container(42);
         assert!(dns.servers.is_empty());
+    }
+
+    /// #715: gRPC looks up `_grpclb._tcp.<name>` before the name's A
+    /// records. The service belongs to this network, so answer NODATA
+    /// instead of forwarding a query only an upstream can time out on.
+    #[test]
+    fn service_names_of_known_containers_are_answered_nodata() {
+        let mut dns = Dns::default();
+        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: None });
+        dns.register("kiri1", ["temporal"].iter(), [10, 5, 0, 3]);
+        let q = query("_grpclb._tcp.temporal", 33);
+        let r = dns.answer(0, &q).expect("the SRV lookup is answered here, not forwarded");
+        assert_eq!((r[3] & 0x0f, answers(&r, q.len()).len()), (0, 0), "NOERROR with no SRV records");
+        assert_eq!(&r[12..q.len()], &q[12..], "the question is echoed back");
+        // The service has no A record either, even though the container does.
+        let q = query("_grpclb._tcp.temporal", 1);
+        assert!(answers(&dns.answer(0, &q).unwrap(), q.len()).is_empty());
+        // A service under a name we don't know is still forwarded.
+        assert!(dns.answer(0, &query("_grpclb._tcp.other", 33)).is_none());
+    }
+
+    /// #715: a forwarded query whose upstream never answers must get a
+    /// SERVFAIL rather than being dropped, leaving Go's resolver to hit
+    /// its own timeout with no reply at all from 127.0.0.11.
+    #[test]
+    fn a_forwarded_query_that_times_out_gets_servfail() {
+        use std::os::fd::AsRawFd;
+        use std::time::{Duration, Instant};
+        let bind = |ip: [u8; 4]| {
+            let s = udp_socket().unwrap();
+            let a = super::sockaddr(ip, 0);
+            assert_eq!(unsafe { libc::bind(s.as_raw_fd(), (&a as *const libc::sockaddr_in).cast(), std::mem::size_of::<libc::sockaddr_in>() as u32) }, 0, "bind");
+            s
+        };
+        let addr = |fd: i32| {
+            let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::sockaddr_in>() as u32;
+            unsafe { libc::getsockname(fd, (&mut a as *mut libc::sockaddr_in).cast(), &mut len) };
+            a
+        };
+        let server = bind([127, 0, 0, 3]);
+        let client = bind([127, 0, 0, 1]);
+        let mut dns = Dns::default();
+        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: server, container: None });
+        let q = query("example.com", 1);
+        dns.forward(0, &q, addr(client.as_raw_fd()), &[[127, 0, 0, 2]]);
+        let p = dns.pending.last_mut().expect("forwarded");
+        p.sent = Instant::now() - Duration::from_secs(10);
+        p.may_relay = false; // no host relay left to wait for
+        dns.on_timer();
+        assert!(dns.pending.is_empty(), "the query is done");
+        let mut buf = [0u8; 512];
+        let n = {
+            let mut got = None;
+            for _ in 0..100 {
+                let n = unsafe { libc::recv(client.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+                if n > 12 {
+                    got = Some(n);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            got.expect("the client got a reply")
+        };
+        assert_eq!(&buf[2..4], &[0x81, 0x82], "recursion available, SERVFAIL");
+        assert_eq!(&buf[12..n as usize], &q[12..], "the question is echoed back");
     }
 
     /// #294: a container on its project's network and on a shared one, both
@@ -1722,7 +1826,10 @@ mod tests {
         let mut dns = Dns::default();
         assert_eq!(dns.timeout_ms(), -1, "nothing pending");
         dns.pending.push(pending());
-        assert_eq!(dns.timeout_ms(), -1, "nothing to hand over");
+        // With no host to try, the query still needs a wake-up at its
+        // timeout so it gets a SERVFAIL instead of being left unanswered.
+        let t = dns.timeout_ms();
+        assert!((4000..=5000).contains(&t), "only the forward wait: {t}");
         let mut p = pending();
         p.may_relay = true;
         dns.pending.push(p);
@@ -1733,6 +1840,13 @@ mod tests {
         assert_eq!(dns.timeout_ms(), 0);
         dns.on_timer();
         assert!(!dns.pending[1].may_relay);
+        let t = dns.timeout_ms();
+        assert!((4000..=5000).contains(&t), "the relayed query still has its wait: {t}");
+        for p in &mut dns.pending {
+            p.sent = Instant::now() - super::FORWARD_TIMEOUT;
+        }
+        dns.on_timer();
+        assert!(dns.pending.is_empty(), "both queries answered at their timeout");
         assert_eq!(dns.timeout_ms(), -1);
     }
 

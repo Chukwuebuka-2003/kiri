@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #715 DNS: Go clients' SRV lookups are answered here, and forwarded lookups are never silently dropped (unreleased)
+- Fixes: #715 Go gRPC clients (RoadRunner's Temporal plugin) fail with "context deadline exceeded" resolving container names via 127.0.0.11 while getent/nslookup/dig work
+- Caused: none known
+- Caused by: -
+- Check: `dns-user-net-srv-nodata`
+
 ### #608 Mac: the memory balloon leaves the guest its headroom, so containers don't stall every few seconds (unreleased)
 - Fixes: #509 Containers on a user network get TCP resets under sustained load (Supabase local stack: Kong → PostgREST); #646 kiri-balloon oscillates violently on idle VM: 100% CPU, 18+ TB page-in thrashing, bloated host RAM; #210 macOS: containers report hundreds of GB of block reads while the guest has no page cache
 - Caused: none known

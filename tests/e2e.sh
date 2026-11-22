@@ -793,6 +793,10 @@ t dns-user-net-fourth-server-unused "none" $D run --rm --network ipamnet --dns 1
 t dns-user-net-ipv6-server-skipped "example.com" $D run --rm --network ipamnet --dns 2001:db8::53 --dns 9.9.9.9 alpine getent hosts example.com
 t dns-user-net-ipv6-ahead-of-three-ipv4 "example.com" $D run --rm --network ipamnet --dns 2001:db8::53 --dns 10.231.0.10 --dns 10.231.0.10 --dns 9.9.9.9 alpine getent hosts example.com
 t dns-user-net-ipv6-only-names "10.231.0.10" $D run --rm --network ipamnet --dns 2001:db8::53 alpine nslookup fixed
+# #715: gRPC looks up `_grpclb._tcp.<name>` before the name's A records.
+# The service is on this network, so it is answered NODATA here rather than
+# forwarded: a silent --dns server must not turn the lookup into a timeout.
+t dns-user-net-srv-nodata "NOERROR 0" $D run --rm --network ipamnet --dns 192.0.2.1 kiri-e2e-dig sh -c 'o=$(dig +tries=1 +time=2 _grpclb._tcp.fixed. SRV); s=$(echo "$o" | grep -o "status: [A-Z]*"); a=$(echo "$o" | grep -o "ANSWER: [0-9]*"); echo "${s#status: } ${a#ANSWER: }"'
 # Timing, asked with one dig query each (dig does not re-ask, as nslookup does)
 # in a fresh container, so the kernel's limit on "port unreachable" replies is
 # not reached: three refusing servers answer SERVFAIL at once, and three silent
