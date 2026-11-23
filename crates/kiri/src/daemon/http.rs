@@ -174,14 +174,22 @@ pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -
             if n > MAX_BODY || req.body.len().checked_add(n).is_none_or(|t| t > MAX_BODY) {
                 return Ok(Some(too_large(req)));
             }
+            // A zero chunk has no data and no CRLF of its own: the line's
+            // CRLF is already read, and the trailer section follows.
+            if n == 0 {
+                // The body ends with the trailer section and a line of its
+                // own (RFC 9112 §7.1.2). Its bytes are part of this request:
+                // left in the buffer, `X-Checksum: 1` (or the closing blank
+                // line alone) reads as the next request's head, and the
+                // client gets an answer to a request it never sent.
+                read_trailers(r)?;
+                break;
+            }
             let start = req.body.len();
             req.body.resize(start + n, 0);
             r.read_exact(&mut req.body[start..])?;
             let mut crlf = [0u8; 2];
             r.read_exact(&mut crlf)?;
-            if n == 0 {
-                break;
-            }
         }
     } else if let Some(len) = req.header("content-length").and_then(|v| v.parse::<usize>().ok()) {
         if len > MAX_BODY {
@@ -191,6 +199,30 @@ pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -
         r.read_exact(&mut req.body)?;
     }
     Ok(Some(req))
+}
+
+/// Reads out a chunked body's trailer section: header lines until the empty
+/// line that ends them. Bounded, so a client cannot keep the daemon reading
+/// (or growing memory) with an endless one.
+fn read_trailers(r: &mut BufReader<UnixStream>) -> io::Result<()> {
+    /// The most a trailer section may be, all lines together.
+    const MAX_TRAILERS: u64 = 8 << 10;
+    let mut left = MAX_TRAILERS;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = (&mut *r).take(left.min(MAX_TRAILERS)).read_line(&mut line)?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "trailers cut short"));
+        }
+        left = left.saturating_sub(n as u64);
+        if line.trim_end().is_empty() {
+            return Ok(());
+        }
+        if left == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "trailers too large"));
+        }
+    }
 }
 
 /// A request whose body is past [`MAX_BODY`]: what was read of it is dropped
@@ -638,6 +670,32 @@ mod tests {
         assert!(!r.contains("Connection:"), "{r}");
         let r = answer(kept, &|w| json(w, 200, "{}"));
         assert!(!r.contains("Connection:"), "{r}");
+    }
+
+    /// A chunked body ends with its trailer section and a line of its own
+    /// (RFC 9112 §7.1.2). Left in the buffer, those bytes are read as the
+    /// next request's head: the client got an answer to a request it never
+    /// sent, and the connection was then cut with "bad request line".
+    #[test]
+    fn chunked_bodies_take_their_trailers_with_them() {
+        use std::io::Write;
+        let next = |raw: &str| {
+            let (mut a, b) = UnixStream::pair().unwrap();
+            a.write_all(raw.as_bytes()).unwrap();
+            drop(a);
+            let mut r = BufReader::new(b);
+            let first = read_request(&mut r, |_, _| false).unwrap().unwrap();
+            assert_eq!(first.body, b"{}", "the body");
+            let second = read_request(&mut r, |_, _| false).unwrap().unwrap();
+            (second.method, second.path)
+        };
+        let head = "POST /containers/create HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n";
+        // With trailers, and with none: both end with a blank line that
+        // belongs to the body.
+        for tail in ["X-Checksum: 1\r\n\r\n", "\r\n"] {
+            let raw = format!("{head}{tail}GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n");
+            assert_eq!(next(&raw), ("GET".to_owned(), "/_ping".to_owned()), "{tail:?}");
+        }
     }
 
     #[test]
