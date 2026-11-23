@@ -80,6 +80,8 @@ mod tools;
 #[cfg(target_os = "macos")]
 mod update;
 
+/// Every command, as the help prints them; [`usage`] leaves out the ones
+/// this build does not have.
 const USAGE: &str = "\
 usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
                              logs, stop, rm, images, pull, build, compose…
@@ -104,6 +106,30 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri boot [--console] [--pings N]
        kiri raw run [--rm] [-e KEY=VALUE]... IMAGE [COMMAND...]   (its own guest, no daemon)
        kiri raw pull <image> | raw images | raw rmi <image>...";
+
+/// The commands this build has, as the usage lists them: the Mac app's own
+/// (`setup`, `update`, `import`) and the ones that boot a guest themselves
+/// (`bench`, `boot`) are left out of the engine's CLI on Linux and in WSL,
+/// and `bridge` is the Linux end of kiri-win's proxy relay. A line the build
+/// does not have is dropped, so the help never offers a command that would
+/// only print this list again.
+fn usage() -> String {
+    // Not on a Mac, where the filter below is the other one.
+    #[cfg(not(target_os = "macos"))]
+    const MAC_ONLY: [&str; 5] = ["setup", "update", "import", "bench", "boot"];
+    USAGE
+        .lines()
+        .filter(|line| {
+            let Some(rest) = line.trim_start().strip_prefix("kiri ") else { return true };
+            let word = rest.split([' ', '|']).next().unwrap_or_default();
+            #[cfg(target_os = "macos")]
+            return word != "bridge";
+            #[cfg(not(target_os = "macos"))]
+            return !MAC_ONLY.contains(&word);
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 fn main() -> ExitCode {
     flavor::init();
@@ -140,7 +166,7 @@ fn main() -> ExitCode {
             Some("images") => images::list(&args[2..]),
             Some("rmi") => images::remove(&args[2..]),
             _ => {
-                eprintln!("{USAGE}");
+                eprintln!("{}", usage());
                 return ExitCode::FAILURE;
             }
         },
@@ -202,7 +228,7 @@ fn main() -> ExitCode {
         #[cfg(windows)]
         Some(c) if wsl::COMMANDS.contains(&c) => wsl::run(&args),
         _ => {
-            eprintln!("{USAGE}");
+            eprintln!("{}", usage());
             return ExitCode::FAILURE;
         }
     };
@@ -273,5 +299,25 @@ fn engine_version_check() {
     if engine != me && engine != "0.0.0" {
         let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "kiri".into());
         eprintln!("kiri: this kiri ({exe}) is {me}, but the engine runs {engine}. Restart the engine to use one version (Kiri → Restart engine), or remove the older kiri.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The help lists what this build has, and nothing else: `kiri import`
+    /// printed the whole list back on Linux, because it was not there.
+    #[test]
+    fn the_help_lists_the_commands_this_build_has() {
+        let u = super::usage();
+        for c in ["kiri daemon", "kiri ui", "kiri build-with", "kiri domains", "kiri registry", "kiri diag logs", "kiri share", "kiri k8s", "kiri usb", "kiri machine", "kiri raw run"] {
+            assert!(u.contains(c), "{c} is missing:\n{u}");
+        }
+        for (c, mac_only) in [("kiri setup", true), ("kiri update", true), ("kiri import", true), ("kiri bench", true), ("kiri boot", true), ("kiri bridge", false)] {
+            let here = cfg!(target_os = "macos") == mac_only;
+            assert_eq!(u.contains(c), here, "{c} on {}:\n{u}", std::env::consts::OS);
+        }
+        // The list is still one command a line, opening with the usage line.
+        assert!(u.starts_with("usage: kiri COMMAND"));
+        assert!(u.lines().all(|l| !l.is_empty()), "{u}");
     }
 }
