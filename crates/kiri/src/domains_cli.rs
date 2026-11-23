@@ -76,7 +76,13 @@ fn answer(r: client::Response) -> io::Result<Value> {
 }
 
 pub fn run(args: &[String]) -> io::Result<()> {
-    let v = match parse(args).map_err(io::Error::other)? {
+    let cmd = parse(args).map_err(io::Error::other)?;
+    // Before asking it anything: with no engine, the socket is missing and a
+    // raw "No such file or directory" says nothing about why.
+    if !client::alive() {
+        return Err(io::Error::other("kiri daemon is not running: open Kiri or run `kiri daemon`"));
+    }
+    let v = match cmd {
         Cmd::Show => client::get("/kiri/domains")?,
         Cmd::Set { http, https } => {
             let now = if http.is_none() || https.is_none() { client::get("/kiri/domains")? } else { Value::Null };
