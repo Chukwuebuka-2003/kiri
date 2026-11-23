@@ -230,6 +230,28 @@ pub fn unverified(c: &kiri_image::RegistryConfig, names: &[String]) -> Vec<Strin
     out
 }
 
+/// A TOML basic string. A name or a mirror goes into buildkitd.toml, and one
+/// with a quote or a backslash in it would close the string: buildkitd would
+/// refuse the whole file, so every build would fail, and the image that
+/// carried the name is recorded, so it would keep failing.
+fn quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// buildkitd.toml's registry tables, for `c` (daemon.json's settings) and
 /// `names` ([`registry_names`]).
 pub fn config(engine: &Engine, c: &kiri_image::RegistryConfig, names: &[String]) -> String {
@@ -245,9 +267,9 @@ pub fn config(engine: &Engine, c: &kiri_image::RegistryConfig, names: &[String])
     registries(&mut tables, c, names);
     let mut out = String::new();
     for (registry, t) in tables {
-        out.push_str(&format!("[registry.\"{registry}\"]\n"));
+        out.push_str(&format!("[registry.{}]\n", quoted(&registry)));
         if !t.mirrors.is_empty() {
-            let list = t.mirrors.iter().map(|m| format!("\"{m}\"")).collect::<Vec<_>>().join(", ");
+            let list = t.mirrors.iter().map(|m| quoted(m)).collect::<Vec<_>>().join(", ");
             out.push_str(&format!("  mirrors = [{list}]\n"));
         }
         if let Some(http) = t.http {
@@ -547,5 +569,20 @@ mod tests {
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "0123456789abcdef0123456789abcdef");
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// A registry name from an image reaches buildkitd.toml. A quote or a
+    /// backslash in it must not close the string: buildkitd refuses the whole
+    /// file, and every build fails until the image is removed.
+    #[test]
+    fn names_are_quoted_for_toml() {
+        assert_eq!(super::quoted("registry.corp"), "\"registry.corp\"");
+        assert_eq!(super::quoted("evil\".com"), "\"evil\\\".com\"");
+        assert_eq!(super::quoted("a\\b"), "\"a\\\\b\"");
+        assert_eq!(super::quoted("a\u{7}b"), "\"a\\u0007b\"");
+        // A name that could have carried one is not a reference any more.
+        for bad in ["evil\".com/x:1", "evil\\com/x:1", "host/x:ta\"g", "host/x?y:1", "h#x/y:1"] {
+            assert!(kiri_image::Reference::parse(bad).is_err(), "{bad:?}");
+        }
     }
 }

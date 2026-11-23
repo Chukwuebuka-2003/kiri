@@ -76,6 +76,21 @@ impl Reference {
         if repository.split('/').any(str::is_empty) {
             return Err(bad());
         }
+        // A reference names a registry on the network and a path in a store, and
+        // is written into buildkitd.toml, log lines and other programs' arguments.
+        // Only the characters of a host name, a repository path and a tag are
+        // allowed: a quote or a backslash in a name a `docker load` archive
+        // supplies would close a string wherever it is written.
+        fn named(s: &str) -> bool {
+            !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-' | b'/' | b':' | b'[' | b']'))
+        }
+        fn tagged(s: &str) -> bool {
+            // `:` for a digest (`sha256:…`), which is not a tag but sits there.
+            !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
+        }
+        if !named(&registry) || !named(&repository) || !tagged(&reference) {
+            return Err(bad());
+        }
         Ok(Reference { registry, repository, reference })
     }
 
