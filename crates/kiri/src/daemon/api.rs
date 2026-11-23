@@ -5750,7 +5750,7 @@ mod tests {
         engine.store.put_image(kiri_image::Image {
             name: super::super::builder::IMAGE.into(),
             digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
-            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(), mirror: None,
         }).unwrap();
 
         let raw = |bytes: &[u8]| -> String {
