@@ -243,9 +243,13 @@ async fn session_tunnel(buildx_fd: OwnedFd, request: h2::client::SendRequest<Byt
     // buildkitd ends the session stream when the build is done. buildx keeps
     // its half open (it is a gRPC server), so waiting for both directions
     // here would deadlock: close the buildx side once the guest is finished.
-    let down = down.await.map_err(join_error)?;
+    let down = down.await.map_err(join_error);
+    // Abort the other direction even when this one ended in an error: the
+    // `?` below would otherwise return before `to_buildkit` is dropped,
+    // leaving buildkitd's session stream open and Solve hanging forever.
     up.abort();
     let _ = up.await;
+    let down = down?;
     diag::info!("BuildKit session ended", down = format!("{down:?}"));
     down?;
     Ok(())
