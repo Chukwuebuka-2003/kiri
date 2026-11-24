@@ -134,9 +134,11 @@ fn config_toml(limit: u64, registries: &str) -> String {
 /// limits and the `FROM` mirror.
 pub(crate) fn guest_config(engine: &Engine) -> String {
     let names = super::mirror::registry_names(engine);
-    // The built-in builder has no container or host network of its own.
-    let current = Registries::now(&names, false);
-    config_toml(cache_limit(), &super::mirror::config_for(engine, &current.config, &names, false))
+    // On a Linux host buildkitd runs on the host itself, so the build mirror
+    // must be at 127.0.0.1, not at the address the guest would use.
+    let host_net = cfg!(target_os = "linux");
+    let current = Registries::now(&names, host_net);
+    config_toml(cache_limit(), &super::mirror::config_for(engine, &current.config, &names, host_net))
 }
 
 /// The pinned BuildKit image's layers, newest first, for `BuildkitStart`.

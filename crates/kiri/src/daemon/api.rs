@@ -26,7 +26,8 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Res
     // request line (prior knowledge). Peek without consuming so the relay
     // gets to read the preface itself.
     if h2_preface(&stream)? {
-        super::grpc::serve(stream, engine);
+        engine.touch();
+        super::grpc::serve(stream, engine, None);
         return Ok(());
     }
     let mut w = stream.try_clone()?;
@@ -53,9 +54,13 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Res
         // the h2 preface, so nothing is buffered yet: hand the inner stream to
         // the BuildKit relay, which speaks h2 from here on.
         if h2c_buildkit(&req) {
+            // buildkitd registers a session from the headers of the /session
+            // upgrade, which moby normally passes on via Control.Session.
+            let session = (req.path == "/session").then(|| req.headers().to_vec());
+            engine.touch();
             http::h2c_upgrade(&mut w)?;
             drop(w);
-            super::grpc::serve(r.into_inner(), engine);
+            super::grpc::serve(r.into_inner(), engine, session);
             return Ok(());
         }
         // Kiri's own window checks in every few seconds; that isn't use, and

@@ -27,10 +27,13 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem",
 # regex-lite: RE2 syntax like Go's regexp, without the Unicode tables' size.
 regex-lite = "0.1"
 # The built-in builder (daemon/grpc.rs): buildx's docker driver speaks gRPC
-# over HTTP/2 cleartext. The relay copies the framed bytes both ways, so no
-# h2/http/bytes crates are needed. `tokio` runs only these sessions; the engine
-# stays thread-based, as it must stay tiny and without a full runtime.
+# over HTTP/2 cleartext. The control path is a raw byte tunnel; the session
+# path needs h2 to open buildkitd's Control.Session stream. `tokio` runs only
+# these sessions; the engine stays thread-based, without a full runtime.
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"
 
 [target.'cfg(any(unix, windows))'.dependencies]
 libc = "0.2"

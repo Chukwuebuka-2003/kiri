@@ -83,6 +83,12 @@ impl Request {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str())
     }
 
+    /// All headers, for the BuildKit session proxy: buildkitd registers a
+    /// session from the `X-Docker-Expose-Session-*` headers of the upgrade.
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
     /// The connection closes after this request's response: the client
     /// sent `Connection: close` (Docker.DotNet does on every request), or
     /// spoke HTTP/1.0 without `Connection: keep-alive` (RFC 9112 §9.3), as
