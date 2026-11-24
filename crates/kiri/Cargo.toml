@@ -30,7 +30,7 @@ regex-lite = "0.1"
 # over HTTP/2 cleartext. The control path is a raw byte tunnel; the session
 # path needs h2 to open buildkitd's Control.Session stream. `tokio` runs only
 # these sessions; the engine stays thread-based, without a full runtime.
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 h2 = "0.4"
 http = "1"
 bytes = "1"

@@ -159,13 +159,24 @@ async fn tunnel(buildx_fd: OwnedFd, guest_fd: OwnedFd) -> io::Result<()> {
 
     let (mut from_buildx, mut to_buildx) = tokio::io::split(RawFdStream::new(buildx_fd)?);
     let (mut from_guest, mut to_guest) = tokio::io::split(RawFdStream::new(guest_fd)?);
-    let up = tokio::spawn(async move { copy(&mut from_buildx, &mut to_guest).await });
-    let down = tokio::spawn(async move { copy(&mut from_guest, &mut to_buildx).await });
-    let up = up.await.map_err(join_error)?;
-    let down = down.await.map_err(join_error)?;
-    diag::info!("BuildKit tunnel ended", up = format!("{up:?}"), down = format!("{down:?}"));
-    up?;
-    down?;
+    let mut up = tokio::spawn(async move { copy(&mut from_buildx, &mut to_guest).await });
+    let mut down = tokio::spawn(async move { copy(&mut from_guest, &mut to_buildx).await });
+    // Either client can close first. Finish the other side as soon as one
+    // ends, otherwise buildx can wait forever for a status stream to close.
+    let (result, finished_up) = tokio::select! {
+        r = &mut up => (r, true),
+        r = &mut down => (r, false),
+    };
+    if finished_up {
+        down.abort();
+        let _ = down.await;
+    } else {
+        up.abort();
+        let _ = up.await;
+    }
+    let result = result.map_err(join_error)?;
+    diag::info!("BuildKit tunnel ended", result = format!("{result:?}"));
+    result?;
     Ok(())
 }
 
