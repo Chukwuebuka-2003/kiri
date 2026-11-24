@@ -207,11 +207,27 @@ async fn session_tunnel(buildx_fd: OwnedFd, request: h2::client::SendRequest<Byt
     let (reply, mut to_buildkit) = ready.send_request(req, false).map_err(grpc_error)?;
 
     let (mut from_buildx, mut to_buildx) = tokio::io::split(RawFdStream::new(buildx_fd)?);
-    // Whichever direction finishes first closes the gRPC stream with
-    // END_STREAM. A bare drop of `to_buildkit` can leave buildkitd's
-    // session registered, so its Solve never completes and buildx hangs.
-    let sender = Arc::new(tokio::sync::Mutex::new(Some(to_buildkit)));
-    let up_sender = sender.clone();
+    // Serialize sends in one task that owns the stream. A shared lock held
+    // while waiting for gRPC write quota deadlocks the other direction,
+    // which cannot deliver its output or close the session (buildkit #7239).
+    enum ToGuest {
+        Data(Bytes),
+        Close,
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToGuest>();
+    let sender = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                ToGuest::Data(bytes) => send_framed(&mut to_buildkit, &bytes).await?,
+                ToGuest::Close => {
+                    let _ = to_buildkit.send_data(Bytes::new(), true);
+                    break;
+                }
+            }
+        }
+        Ok::<(), io::Error>(())
+    });
+    let up_tx = tx.clone();
     let up = tokio::spawn(async move {
         let mut buf = [0u8; 64 * 1024];
         let mut total = 0u64;
@@ -221,19 +237,13 @@ async fn session_tunnel(buildx_fd: OwnedFd, request: h2::client::SendRequest<Byt
                 break;
             }
             LAST_USE.store(now_secs(), Ordering::Relaxed);
-            let mut guard = up_sender.lock().await;
-            if let Some(stream) = guard.as_mut() {
-                send_framed(stream, &bytes_message(&buf[..n])).await?;
-            }
+            up_tx.send(ToGuest::Data(bytes_message(&buf[..n]))).map_err(|_| io::Error::other("session sender is gone"))?;
             total += n as u64;
         }
-        let mut guard = up_sender.lock().await;
-        if let Some(mut stream) = guard.take() {
-            let _ = stream.send_data(Bytes::new(), true);
-        }
+        let _ = up_tx.send(ToGuest::Close);
         Ok::<u64, io::Error>(total)
     });
-    let down_sender = sender.clone();
+    let down_tx = tx.clone();
     let down = tokio::spawn(async move {
         let (_, mut from_buildkit) = reply.await.map_err(grpc_error)?.into_parts();
         let mut frames = Frames::default();
@@ -258,11 +268,7 @@ async fn session_tunnel(buildx_fd: OwnedFd, request: h2::client::SendRequest<Byt
             }
         }
         let _ = poll_fn(|cx| from_buildkit.poll_trailers(cx)).await;
-        let mut guard = down_sender.lock().await;
-        if let Some(mut stream) = guard.take() {
-            let _ = stream.send_data(Bytes::new(), true);
-        }
-        drop(guard);
+        let _ = down_tx.send(ToGuest::Close);
         match write_error {
             Some(e) => Err(e),
             None => Ok(total),
@@ -281,6 +287,8 @@ async fn session_tunnel(buildx_fd: OwnedFd, request: h2::client::SendRequest<Byt
         up.abort();
         let _ = up.await;
     }
+    sender.abort();
+    let _ = sender.await;
     let result = result.map_err(join_error)?;
     diag::info!("BuildKit session ended", result = format!("{result:?}"));
     result?;
