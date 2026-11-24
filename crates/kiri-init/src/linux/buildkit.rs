@@ -94,6 +94,11 @@ fn spawn(layer_root: &Path, recipe: &(Vec<String>, String)) -> io::Result<libc::
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(LOG, b"")?;
+    // On a Mac the guest's /run/kiri is not made by the host daemon (it
+    // lives on the Mac), so create it here before writing the config.
+    if let Some(parent) = Path::new(CONFIG).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(CONFIG, recipe.1.as_bytes())?;
 
     let binary = which(layer_root, &recipe.0, "usr/bin/buildkitd")
