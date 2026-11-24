@@ -207,6 +207,11 @@ async fn session_tunnel(buildx_fd: OwnedFd, request: h2::client::SendRequest<Byt
     let (reply, mut to_buildkit) = ready.send_request(req, false).map_err(grpc_error)?;
 
     let (mut from_buildx, mut to_buildx) = tokio::io::split(RawFdStream::new(buildx_fd)?);
+    // Whichever direction finishes first closes the gRPC stream with
+    // END_STREAM. A bare drop of `to_buildkit` can leave buildkitd's
+    // session registered, so its Solve never completes and buildx hangs.
+    let sender = Arc::new(tokio::sync::Mutex::new(Some(to_buildkit)));
+    let up_sender = sender.clone();
     let up = tokio::spawn(async move {
         let mut buf = [0u8; 64 * 1024];
         let mut total = 0u64;
@@ -216,12 +221,19 @@ async fn session_tunnel(buildx_fd: OwnedFd, request: h2::client::SendRequest<Byt
                 break;
             }
             LAST_USE.store(now_secs(), Ordering::Relaxed);
-            send_framed(&mut to_buildkit, &bytes_message(&buf[..n])).await?;
+            let mut guard = up_sender.lock().await;
+            if let Some(stream) = guard.as_mut() {
+                send_framed(stream, &bytes_message(&buf[..n])).await?;
+            }
             total += n as u64;
         }
-        to_buildkit.send_data(Bytes::new(), true).map_err(grpc_error)?;
+        let mut guard = up_sender.lock().await;
+        if let Some(mut stream) = guard.take() {
+            let _ = stream.send_data(Bytes::new(), true);
+        }
         Ok::<u64, io::Error>(total)
     });
+    let down_sender = sender.clone();
     let down = tokio::spawn(async move {
         let (_, mut from_buildkit) = reply.await.map_err(grpc_error)?.into_parts();
         let mut frames = Frames::default();
@@ -246,23 +258,32 @@ async fn session_tunnel(buildx_fd: OwnedFd, request: h2::client::SendRequest<Byt
             }
         }
         let _ = poll_fn(|cx| from_buildkit.poll_trailers(cx)).await;
+        let mut guard = down_sender.lock().await;
+        if let Some(mut stream) = guard.take() {
+            let _ = stream.send_data(Bytes::new(), true);
+        }
+        drop(guard);
         match write_error {
             Some(e) => Err(e),
             None => Ok(total),
         }
     });
-    // buildkitd ends the session stream when the build is done. buildx keeps
-    // its half open (it is a gRPC server), so waiting for both directions
-    // here would deadlock: close the buildx side once the guest is finished.
-    let down = down.await.map_err(join_error);
-    // Abort the other direction even when this one ended in an error: the
-    // `?` below would otherwise return before `to_buildkit` is dropped,
-    // leaving buildkitd's session stream open and Solve hanging forever.
-    up.abort();
-    let _ = up.await;
-    let down = down?;
-    diag::info!("BuildKit session ended", down = format!("{down:?}"));
-    down?;
+    let mut up = up;
+    let mut down = down;
+    let (result, finished_up) = tokio::select! {
+        r = &mut up => (r, true),
+        r = &mut down => (r, false),
+    };
+    if finished_up {
+        down.abort();
+        let _ = down.await;
+    } else {
+        up.abort();
+        let _ = up.await;
+    }
+    let result = result.map_err(join_error)?;
+    diag::info!("BuildKit session ended", result = format!("{result:?}"));
+    result?;
     Ok(())
 }
 
