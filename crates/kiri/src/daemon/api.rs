@@ -27,7 +27,8 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Res
     // gets to read the preface itself.
     if h2_preface(&stream)? {
         engine.touch();
-        super::grpc::serve(stream, engine, None);
+        let ready = super::grpc::prepare(engine.clone());
+        super::grpc::serve(stream, ready, engine, None);
         return Ok(());
     }
     let mut w = stream.try_clone()?;
@@ -58,9 +59,10 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Res
             // upgrade, which moby normally passes on via Control.Session.
             let session = (req.path == "/session").then(|| req.headers().to_vec());
             engine.touch();
+            let ready = super::grpc::prepare(engine.clone());
             http::h2c_upgrade(&mut w)?;
             drop(w);
-            super::grpc::serve(r.into_inner(), engine, session);
+            super::grpc::serve(r.into_inner(), ready, engine, session);
             return Ok(());
         }
         // Kiri's own window checks in every few seconds; that isn't use, and

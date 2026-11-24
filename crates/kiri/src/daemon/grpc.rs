@@ -56,10 +56,21 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// Start booting/pulling buildkitd before the caller answers buildx's 101,
+/// so buildx does not time out waiting for the h2 preface while the first
+/// build starts the guest agent.
+pub fn prepare(engine: Arc<Engine>) -> tokio::sync::oneshot::Receiver<io::Result<OwnedFd>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    runtime().spawn(async move {
+        let _ = tx.send(dial(&engine).await);
+    });
+    rx
+}
+
 /// A buildx connection arrives here from the socket accept loop. `session`
 /// holds the upgrade headers for `/session`, which buildkitd needs to register
 /// the session; `/grpc` arrives with None and is tunneled byte for byte.
-pub fn serve(conn: UnixStream, engine: Arc<Engine>, session: Option<Vec<(String, String)>>) {
+pub fn serve(conn: UnixStream, ready: tokio::sync::oneshot::Receiver<io::Result<OwnedFd>>, engine: Arc<Engine>, session: Option<Vec<(String, String)>>) {
     let outcome: io::Result<()> = runtime().block_on(async move {
         // A build can export for longer than the VM's idle window: keep it
         // awake for as long as buildx holds a connection.
@@ -73,7 +84,8 @@ pub fn serve(conn: UnixStream, engine: Arc<Engine>, session: Option<Vec<(String,
             })
         };
         let result = async {
-            let guest = dial(&engine).await?;
+            let buildx = OwnedFd::from(conn);
+            let guest = ready.await.map_err(|e| io::Error::other(e.to_string()))??;
             match session {
                 Some(headers) => {
                     let (request, connection) = match h2::client::handshake(GuestStream::new(guest)?).await {
@@ -85,11 +97,11 @@ pub fn serve(conn: UnixStream, engine: Arc<Engine>, session: Option<Vec<(String,
                             diag::info!("the BuildKit stream went nowhere", error = e.to_string());
                         }
                     });
-                    let result = session_tunnel(OwnedFd::from(conn), request, headers).await;
+                    let result = session_tunnel(buildx, request, headers).await;
                     driver.abort();
                     result
                 }
-                None => tunnel(OwnedFd::from(conn), guest).await,
+                None => tunnel(buildx, guest).await,
             }
         }.await;
         keepalive.abort();
