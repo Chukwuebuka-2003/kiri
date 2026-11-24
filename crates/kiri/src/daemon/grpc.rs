@@ -23,7 +23,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use h2::{RecvStream, SendStream};
+use h2::SendStream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::io::unix::AsyncFd;
 
@@ -498,6 +498,85 @@ mod tests {
         frames.push(&frame[frame.len() - 1..]);
         assert_eq!(frames.next(), Some(data.to_vec()));
         assert_eq!(frames.next(), None);
+    }
+
+    /// The relay against a fake buildkitd that answers each request chunk
+    /// before the request stream ends: BuildKit's session and status RPCs are
+    /// two-way streams that stay open for a whole build.
+    #[test]
+    fn relay_streams_both_ways() {
+        super::runtime().block_on(async {
+            let (buildx, buildx_peer) = UnixStream::pair().unwrap();
+            let (guest, guest_peer) = UnixStream::pair().unwrap();
+            set_nonblocking(buildx_peer.as_raw_fd()).unwrap();
+            set_nonblocking(guest_peer.as_raw_fd()).unwrap();
+            let buildx_peer = tokio::net::UnixStream::from_std(buildx_peer).unwrap();
+            let guest_peer = tokio::net::UnixStream::from_std(guest_peer).unwrap();
+
+            let fake_task = tokio::spawn(async move {
+                let mut server = h2::server::handshake(guest_peer).await.unwrap();
+                let (call, mut respond) = server.accept().await.unwrap().unwrap();
+                tokio::spawn(async move {
+                    while server.accept().await.is_some() {}
+                });
+                let (parts, mut from_buildx) = call.into_parts();
+                assert_eq!(parts.uri.path(), "/buildkit.Session");
+                let mut to_buildx = respond
+                    .send_response(http::Response::builder().status(200).header("content-type", "application/grpc").body(()).unwrap(), false)
+                    .unwrap();
+                let mut seen = Vec::new();
+                while let Some(chunk) = poll_fn(|cx| from_buildx.poll_data(cx)).await {
+                    let chunk = chunk.unwrap();
+                    from_buildx.flow_control().release_capacity(chunk.len()).unwrap();
+                    seen.extend_from_slice(&chunk);
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    // Answer now, without waiting for the request to end.
+                    to_buildx.reserve_capacity(chunk.len());
+                    poll_fn(|cx| to_buildx.poll_capacity(cx)).await.unwrap().unwrap();
+                    let mut echoed = b"echo:".to_vec();
+                    echoed.extend_from_slice(&chunk);
+                    to_buildx.send_data(Bytes::from(echoed), false).unwrap();
+                }
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                to_buildx.send_trailers(trailers).unwrap();
+                seen
+            });
+
+            let buildx_task = tokio::spawn(async move {
+                let (mut request, connection) = h2::client::handshake(buildx_peer).await.unwrap();
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                let req = http::Request::builder().method("POST").uri("http://localhost/buildkit.Session").header("content-type", "application/grpc").body(()).unwrap();
+                let mut ready = request.ready().await.unwrap();
+                let (reply, mut to_builder) = ready.send_request(req, false).unwrap();
+                for piece in [&b"ping"[..], &b"pong"[..]] {
+                    to_builder.reserve_capacity(piece.len());
+                    poll_fn(|cx| to_builder.poll_capacity(cx)).await.unwrap().unwrap();
+                    to_builder.send_data(Bytes::copy_from_slice(piece), false).unwrap();
+                }
+                to_builder.send_data(Bytes::new(), true).unwrap();
+                let (_, mut from_builder) = reply.await.unwrap().into_parts();
+                let mut got = Vec::new();
+                while let Some(chunk) = poll_fn(|cx| from_builder.poll_data(cx)).await {
+                    let chunk = chunk.unwrap();
+                    from_builder.flow_control().release_capacity(chunk.len()).unwrap();
+                    got.extend_from_slice(&chunk);
+                }
+                let trailers = poll_fn(|cx| from_builder.poll_trailers(cx)).await.unwrap().unwrap();
+                assert_eq!(trailers["grpc-status"], "0");
+                got
+            });
+
+            // One side can close just as the other finishes; the assertions
+            // below are what matter for a two-way stream.
+            let _ = tunnel(OwnedFd::from(buildx), OwnedFd::from(guest)).await;
+            assert_eq!(fake_task.await.unwrap(), b"pingpong");
+            assert_eq!(buildx_task.await.unwrap(), b"echo:pingecho:pong");
+        });
     }
 
     #[test]
