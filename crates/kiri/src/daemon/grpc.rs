@@ -54,6 +54,9 @@ fn runtime() -> &'static tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("kiri-grpc")
+            // The relay uses AsyncFd and tokio::time::sleep: without the I/O
+            // and time drivers every session would panic on its first read.
+            .enable_all()
             .build()
             .expect("cannot start the BuildKit runtime")
     })
@@ -74,8 +77,13 @@ pub fn serve(conn: UnixStream, engine: Arc<Engine>) {
                 diag::info!("the BuildKit stream went nowhere", error = e.to_string());
             }
         });
-        let result = session(conn, request).await;
+        let (result, tasks) = session(conn, request).await;
+        // The h2 driver and every RPC task belong to this one buildx
+        // connection: none may outlive it when the socket goes away.
         driver.abort();
+        for task in tasks {
+            task.abort();
+        }
         result
     });
     if let Err(e) = outcome {
@@ -105,17 +113,25 @@ impl Drop for ActiveGuard {
 /// buildx end (its h2 cleartext, served by us); `request` sends onto the
 /// guest's h2 stream, whose other end speaks h2 back (buildkitd serving). The
 /// framing is understood by h2 both ways; the tunnel in the middle is all ours.
-pub(crate) async fn session(conn: UnixStream, request: SendRequest<Bytes>) -> io::Result<()> {
+pub(crate) async fn session(conn: UnixStream, request: SendRequest<Bytes>) -> (io::Result<()>, Vec<tokio::task::JoinHandle<()>>) {
     let _active = ActiveGuard::new();
     LAST_USE.store(now_secs(), Ordering::Relaxed);
+    let mut tasks = Vec::new();
 
     // The server half answers buildx's h2 connection. The client half (the
     // h2 driver and its `SendRequest`) was set up by `dial` and is polled by
     // `serve`.
-    conn.set_nonblocking(true)?;
-    let mut server = h2::server::handshake(tokio::net::UnixStream::from_std(conn)?)
-        .await
-        .map_err(grpc_error)?;
+    if let Err(e) = conn.set_nonblocking(true) {
+        return (Err(e), tasks);
+    }
+    let stream = match tokio::net::UnixStream::from_std(conn) {
+        Ok(s) => s,
+        Err(e) => return (Err(e), tasks),
+    };
+    let mut server = match h2::server::handshake(stream).await {
+        Ok(s) => s,
+        Err(e) => return (Err(grpc_error(e)), tasks),
+    };
 
     // buildx's RPCs, each onto its own task, so answers come in whatever
     // order buildkitd finishes them.
@@ -123,12 +139,12 @@ pub(crate) async fn session(conn: UnixStream, request: SendRequest<Bytes>) -> io
         match received {
             Ok((call, respond)) => {
                 let (parts, from_buildx) = call.into_parts();
-                tokio::spawn(relay_one(parts, from_buildx, respond, request.clone()));
+                tasks.push(tokio::spawn(relay_one(parts, from_buildx, respond, request.clone())));
             }
-            Err(e) => return Err(grpc_error(e)),
+            Err(e) => return (Err(grpc_error(e)), tasks),
         }
     }
-    Ok(())
+    (Ok(()), tasks)
 }
 
 /// One gRPC call in and out: the request's headers told to buildkitd first
@@ -148,12 +164,15 @@ async fn relay(
     parts: &http::request::Parts,
     from_buildx: RecvStream,
     mut respond: SendResponse<Bytes>,
-    mut request: SendRequest<Bytes>,
+    request: SendRequest<Bytes>,
 ) -> io::Result<()> {
     // The headers first, so buildkitd can answer while our request is still
     // arriving: BuildKit's session and status calls stay open for a whole
     // build and are two-way, not one message then one reply.
-    let (reply, mut to_builder) = request
+    // h2 requires waiting for capacity before sending: under buildx's many
+    // concurrent streams, sending early returns Rejected instead of waiting.
+    let mut ready = request.ready().await.map_err(grpc_error)?;
+    let (reply, mut to_builder) = ready
         .send_request(http::Request::from_parts(parts.to_owned(), ()), false)
         .map_err(grpc_error)?;
 
@@ -162,6 +181,7 @@ async fn relay(
         let mut from_buildx = from_buildx;
         while let Some(chunk) = poll_fn(|cx| from_buildx.poll_data(cx)).await {
             let chunk = chunk.map_err(grpc_error)?;
+            LAST_USE.store(now_secs(), Ordering::Relaxed);
             from_buildx.flow_control().release_capacity(chunk.len()).map_err(grpc_error)?;
             send_all(&mut to_builder, chunk, false).await?;
         }
@@ -178,6 +198,7 @@ async fn relay(
             .map_err(grpc_error)?;
         while let Some(chunk) = poll_fn(|cx| from_builder.poll_data(cx)).await {
             let chunk = chunk.map_err(grpc_error)?;
+            LAST_USE.store(now_secs(), Ordering::Relaxed);
             from_builder.flow_control().release_capacity(chunk.len()).map_err(grpc_error)?;
             send_all(&mut to_buildx, chunk, false).await?;
         }
@@ -384,6 +405,19 @@ pub fn watch(engine: Arc<Engine>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon's relay runtime must have both drivers: `dial` sleeps and
+    /// `GuestStream` wraps sockets in `AsyncFd`. A runtime built without
+    /// `enable_all` panics on both, which the streaming test below misses because
+    /// it builds its own runtime.
+    #[test]
+    fn the_relay_runtime_has_io_and_time_drivers() {
+        super::runtime().block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            let (socket, _peer) = tokio::net::UnixStream::pair().unwrap();
+            tokio::io::unix::AsyncFd::new(socket).unwrap();
+        });
+    }
 
     /// A fake buildkitd that answers each request chunk with a response chunk
     /// before the request has ended: BuildKit's session and status RPCs are

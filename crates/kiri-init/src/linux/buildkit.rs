@@ -188,17 +188,19 @@ mod tests {
     fn which_takes_the_first_layer_that_has_the_file() {
         let tmp = std::env::temp_dir().join(format!("kiri-buildkit-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
-        let aa = tmp.join(layers::hex("sha256:aa").unwrap());
-        let bb = tmp.join(layers::hex("sha256:bb").unwrap()).join("usr/bin");
+        let a = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let b = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let aa = tmp.join(layers::hex(a).unwrap());
+        let bb = tmp.join(layers::hex(b).unwrap()).join("usr/bin");
         fs::create_dir_all(&aa).unwrap();
         fs::create_dir_all(&bb).unwrap();
         fs::write(bb.join("buildkitd"), b"bytes").unwrap();
         // Seen newest first: a binary only in the older layer is still found.
-        let found = which(&tmp, &["sha256:aa".into(), "sha256:bb".into()], "usr/bin/buildkitd").unwrap();
+        let found = which(&tmp, &[a.into(), b.into()], "usr/bin/buildkitd").unwrap();
         assert!(found.ends_with("usr/bin/buildkitd"));
-        assert!(found.contains(&layers::hex("sha256:bb").unwrap()));
+        assert!(found.contains(layers::hex(b).unwrap()));
         // And a file in no layer is an error.
-        assert!(which(&tmp, &["sha256:aa".into()], "usr/bin/absent").is_err());
+        assert!(which(&tmp, &[a.into()], "usr/bin/absent").is_err());
         let _ = fs::remove_dir_all(&tmp);
     }
 }

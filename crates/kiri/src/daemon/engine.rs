@@ -3211,7 +3211,7 @@ impl Engine {
 
     /// Sends the guest every layer of these (digest, media type) it doesn't
     /// have unpacked, from the blob store.
-    fn ensure_layers<'a>(&self, vm: &VmLink, layers: impl Iterator<Item = (&'a str, &'a str)>) -> io::Result<()> {
+    pub(super) fn ensure_layers<'a>(&self, vm: &VmLink, layers: impl Iterator<Item = (&'a str, &'a str)>) -> io::Result<()> {
         let _one_at_a_time = self.layers.lock().unwrap_or_else(|e| e.into_inner());
         for (digest, media_type) in layers {
             if !vm.has_layer(digest)? {

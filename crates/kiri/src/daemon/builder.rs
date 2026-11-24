@@ -134,14 +134,22 @@ fn config_toml(limit: u64, registries: &str) -> String {
 /// limits and the `FROM` mirror.
 pub(crate) fn guest_config(engine: &Engine) -> String {
     let names = super::mirror::registry_names(engine);
-    let current = Registries::now(&names);
-    config_toml(cache_limit(), &super::mirror::config(engine, &current.config, &names))
+    // The built-in builder has no container or host network of its own.
+    let current = Registries::now(&names, false);
+    config_toml(cache_limit(), &super::mirror::config_for(engine, &current.config, &names, false))
 }
 
-/// The pinned BuildKit image's layers, newest first, for `BuildkitStart`;
-/// pulling it first if it is not here yet.
+/// The pinned BuildKit image's layers, newest first, for `BuildkitStart`.
+/// Pulls the image if needed and unpacks the layers into the guest: the relay
+/// cannot point buildkitd at layer directories that are not there yet (PR #89
+/// review).
 pub(crate) fn guest_layers(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<Vec<String>, Error> {
     let image = ensure_image(engine, say)?;
+    let _pin = engine.pin_layers(image.layers.iter().map(|l| l.digest.as_str()));
+    if !image.layers.is_empty() {
+        let vm = engine.vm()?;
+        engine.ensure_layers(&vm, image.layers.iter().map(|l| (l.digest.as_str(), l.media_type.as_str())))?;
+    }
     Ok(image.layers.iter().rev().map(|l| l.digest.clone()).collect())
 }
 
