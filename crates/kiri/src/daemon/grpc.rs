@@ -215,18 +215,30 @@ async fn session_tunnel(buildx_fd: OwnedFd, request: h2::client::SendRequest<Byt
         let (_, mut from_buildkit) = reply.await.map_err(grpc_error)?.into_parts();
         let mut frames = Frames::default();
         let mut total = 0u64;
+        let mut write_error = None;
         while let Some(chunk) = poll_fn(|cx| from_buildkit.poll_data(cx)).await {
             let chunk = chunk.map_err(grpc_error)?;
             from_buildkit.flow_control().release_capacity(chunk.len()).map_err(grpc_error)?;
             frames.push(&chunk);
             while let Some(message) = frames.next() {
                 LAST_USE.store(now_secs(), Ordering::Relaxed);
-                to_buildx.write_all(&message).await?;
-                total += message.len() as u64;
+                if write_error.is_none() {
+                    if let Err(e) = to_buildx.write_all(&message).await {
+                        // buildx can close as soon as it has the output.
+                        // Keep draining the guest stream so buildkitd sees
+                        // END_STREAM and finishes its Solve.
+                        write_error = Some(e);
+                    } else {
+                        total += message.len() as u64;
+                    }
+                }
             }
         }
         let _ = poll_fn(|cx| from_buildkit.poll_trailers(cx)).await;
-        Ok::<u64, io::Error>(total)
+        match write_error {
+            Some(e) => Err(e),
+            None => Ok(total),
+        }
     });
     // buildkitd ends the session stream when the build is done. buildx keeps
     // its half open (it is a gRPC server), so waiting for both directions
